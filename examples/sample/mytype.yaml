@@ -1,9 +1,11 @@
-apiVersion: sample.processprovider.crossplane.io/v1alpha1
-kind: MyType
+apiVersion: mygroup.processprovider.crossplane.io/v1alpha1
+kind: Process
 metadata:
-  name: example
+  name: test
 spec:
   forProvider:
-    configurableField: test
+    id: "1"
+    serverIp: "kk-crossplane3"
+    serverPort: 12345
   providerConfigRef:
     name: example

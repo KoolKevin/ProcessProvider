@@ -25,6 +25,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
+
 	"github.com/crossplane/crossplane-runtime/pkg/connection"
 	"github.com/crossplane/crossplane-runtime/pkg/controller"
 	"github.com/crossplane/crossplane-runtime/pkg/event"
@@ -35,10 +37,12 @@ import (
 	"github.com/crossplane/provider-processprovider/apis/mygroup/v1alpha1"
 	apisv1alpha1 "github.com/crossplane/provider-processprovider/apis/v1alpha1"
 	"github.com/crossplane/provider-processprovider/internal/features"
+
+	processClientType "github.com/crossplane/provider-processprovider/internal/controller/process/processClientType"
 )
 
 const (
-	errNotProcess    = "managed resource is not a Process custom resource"
+	errNotProcess   = "managed resource is not a Process custom resource"
 	errTrackPCUsage = "cannot track ProviderConfig usage"
 	errGetPC        = "cannot get ProviderConfig"
 	errGetCreds     = "cannot get credentials"
@@ -46,11 +50,19 @@ const (
 	errNewClient = "cannot create new Service"
 )
 
-// A NoOpService does nothing.
-type NoOpService struct{}
+// Un ProcessService è un wrapper a un client http che manda le richieste di
+// creazione/cancellazione di processi al mio server fuori dal cluster
+type ProcessService struct {
+	ProcessClient processClientType.ProcessClient
+}
 
 var (
-	newNoOpService = func(_ []byte) (interface{}, error) { return &NoOpService{}, nil }
+	newProcessService = func(creds []byte) (*ProcessService, error) {
+		processService := ProcessService{}
+		//questa configurazione di default imposta coma url del server kk-crossplane3 e porta 12345
+		processService.ProcessClient.ConfigureClientDefault()
+		return &processService, nil
+	}
 )
 
 // Setup adds a controller that reconciles Process managed resources.
@@ -67,7 +79,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		managed.WithExternalConnecter(&connector{
 			kube:         mgr.GetClient(),
 			usage:        resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
-			newServiceFn: newNoOpService}),
+			newServiceFn: newProcessService}),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
 		managed.WithPollInterval(o.PollInterval),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
@@ -86,7 +98,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 type connector struct {
 	kube         client.Client
 	usage        resource.Tracker
-	newServiceFn func(creds []byte) (interface{}, error)
+	newServiceFn func(creds []byte) (*ProcessService, error)
 }
 
 // Connect typically produces an ExternalClient by:
@@ -128,8 +140,19 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 type external struct {
 	// A 'client' used to connect to the external resource API. In practice this
 	// would be something like an AWS SDK client.
-	service interface{}
+	service *ProcessService
 }
+
+/*
+QUESTO METODO è FATTO MALE!!!
+dovrei riscrivere il server ed aggiungere funzionalità che mi permettano di controllare se
+
+	-un processo esiste o meno
+	-se esiste in che stato si trova
+
+per semplicità uso la mappa qua sotto e faccio degli hack
+*/
+var processiCreati []string
 
 func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
 	cr, ok := mg.(*v1alpha1.Process)
@@ -137,8 +160,25 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{}, errors.New(errNotProcess)
 	}
 
-	// These fmt statements should be removed in the real implementation.
-	fmt.Printf("Observing: %+v", cr)
+	trovato := false
+	for _, id := range processiCreati {
+		if id == cr.Spec.ForProvider.Id {
+			trovato = true
+
+			break
+		}
+	}
+
+	if !trovato {
+		processiCreati = append(processiCreati, cr.Spec.ForProvider.Id)
+		return managed.ExternalObservation{
+			ResourceExists: false,
+		}, nil
+	}
+
+	// questo imposta il flag READY = TRUE quando faccio kubectl get process
+	// imposto che sono sempre ready a prescindere
+	cr.Status.SetConditions(xpv1.Available())
 
 	return managed.ExternalObservation{
 		// Return false when the external resource does not exist. This lets
@@ -163,7 +203,12 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 		return managed.ExternalCreation{}, errors.New(errNotProcess)
 	}
 
-	fmt.Printf("Creating: %+v", cr)
+	//c.service.ProcessClient.ConfigureClient(); 	eventualmente da configurare con i parametri della cr
+
+	//TODO: CreaProcesso per adesso stampa e basta, per aggiornare anche lo stato sarebbe meglio che ritornasse qualcosa -> refactor
+	c.service.ProcessClient.CreaProcesso(cr.Spec.ForProvider.Id)
+
+	cr.Status.AtProvider.StatoProcesso = v1alpha1.Ok //per adesso lo stato lo impostiamo sempre ad ok e basta
 
 	return managed.ExternalCreation{
 		// Optionally return any details that may be required to connect to the
@@ -172,6 +217,7 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 	}, nil
 }
 
+// NON IMPLEMENTATO
 func (c *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
 	cr, ok := mg.(*v1alpha1.Process)
 	if !ok {
@@ -193,7 +239,22 @@ func (c *external) Delete(ctx context.Context, mg resource.Managed) error {
 		return errors.New(errNotProcess)
 	}
 
-	fmt.Printf("Deleting: %+v", cr)
+	c.service.ProcessClient.EliminaProcesso(cr.Spec.ForProvider.Id)
+
+	// altro hack per observe, se non elimino l'elemento dallo slice continuo a mandare richieste di eliminazione
+	indiceDaEliminare := -1
+	for i, id := range processiCreati {
+		if id == cr.Spec.ForProvider.Id {
+			indiceDaEliminare = i
+
+			break
+		}
+	}
+
+	//assumo di trovare sempre il processo e quindi che indiceDaEliminare sia sempre != -1
+	prima := processiCreati[:indiceDaEliminare]
+	dopo := processiCreati[indiceDaEliminare+1:]
+	processiCreati = append(prima, dopo...)
 
 	return nil
 }

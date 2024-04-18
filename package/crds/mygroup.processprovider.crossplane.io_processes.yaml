@@ -67,10 +67,16 @@ spec:
               forProvider:
                 description: ProcessParameters are the configurable fields of a Process.
                 properties:
-                  configurableField:
+                  id:
                     type: string
+                  serverIp:
+                    type: string
+                  serverPort:
+                    type: integer
                 required:
-                - configurableField
+                - id
+                - serverIp
+                - serverPort
                 type: object
               managementPolicies:
                 default:
@@ -275,7 +281,7 @@ spec:
               atProvider:
                 description: ProcessObservation are the observable fields of a Process.
                 properties:
-                  observableField:
+                  statoProcesso:
                     type: string
                 type: object
               conditions:
